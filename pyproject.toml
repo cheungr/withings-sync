@@ -20,11 +20,15 @@ classifiers = ["Topic :: Utilities",
 
 [tool.poetry.dependencies]
 python = "^3.12"
-garth = ">=0.7.11"
 requests = ">=2.32.3"
 lxml = ">=5.3.0"
 python-dotenv = ">=1.0.1"
 importlib-resources = ">=6.4.5"
+curl-cffi = {version = ">=0.9", optional = true}
+ua-generator = {version = ">=1.0", optional = true}
+
+[tool.poetry.extras]
+cffi = ["curl-cffi", "ua-generator"]
 
 [tool.poetry.group.dev.dependencies]
 black = ">=24.10.0"

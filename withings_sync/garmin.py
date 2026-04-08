@@ -4,115 +4,155 @@ import io
 import logging
 import os
 
-import garth
-# Temporary fix until Garth project merges https://github.com/matin/garth/issues/73
-garth.http.USER_AGENT = {"User-Agent": ("GCM-iOS-5.7.2.1")}
+from .garmin_auth import (
+    Client as AuthClient,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 log = logging.getLogger("garmin")
 
 HOME = os.getenv("HOME", ".")
-GARMIN_SESSION = os.path.abspath(os.path.expanduser(os.getenv('GARMIN_SESSION', os.path.join(HOME, ".garmin_session"))))
-
-
-class LoginFailed(Exception):
-    """Raised when login fails."""
-
-
-class APIException(Exception):
-    """Raised for API exceptions."""
+GARMIN_SESSION = os.path.abspath(
+    os.path.expanduser(
+        os.getenv("GARMIN_SESSION", os.path.join(HOME, ".garmin_session"))
+    )
+)
 
 
 class GarminConnect:
-    """Main GarminConnect class."""
+    """Main GarminConnect class.
+
+    Uses the native DI OAuth2 authentication engine to communicate
+    with Garmin Connect.  Session tokens are persisted as JSON so
+    that subsequent runs can skip the login flow.
+    """
 
     def __init__(self, config_folder=None) -> None:
-        self.client = garth.Client()
+        self.client = AuthClient()
         self.config_folder = config_folder
-        
+
         if config_folder:
             self.session_path = os.path.join(config_folder, ".garmin_session")
         else:
             self.session_path = GARMIN_SESSION
-        
+
         # Log helpful message if using new config folder and file doesn't exist
         if config_folder and not os.path.exists(self.session_path):
             home = os.getenv("HOME", ".")
-            legacy_path = os.path.abspath(os.path.expanduser(os.path.join(home, ".garmin_session")))
+            legacy_path = os.path.abspath(
+                os.path.expanduser(os.path.join(home, ".garmin_session"))
+            )
             if os.path.exists(legacy_path):
-                log.info(f"Using new config folder: {self.session_path}")
-                log.info(f"If you want to use existing session, copy from: {legacy_path}")
+                log.info("Using new config folder: %s", self.session_path)
+                log.info(
+                    "Legacy session found at %s — note: old garth-format "
+                    "sessions are NOT compatible. You will need to re-authenticate.",
+                    legacy_path,
+                )
 
     def login(self, email=None, password=None):
-        """Login to Garmin Connect with session persistence and MFA support."""
-        log.debug("Attempting Garmin login")
-        
-        if GarminConnect.invalid_garmin_session_config(self):
-            raise APIException("invalid garmin session path config")
-        
+        """Login to Garmin Connect via DI OAuth2 with session persistence.
+
+        Authentication flow:
+        1. Try to load a previously saved token file (JSON).
+        2. If no valid token exists, authenticate with email/password.
+        3. If MFA is enabled on the account, credential-based login
+           may not complete — set GARMIN_USERNAME / GARMIN_PASSWORD
+           environment variables and ensure the token file is populated
+           from a successful prior login.
+        """
+        log.debug("Attempting Garmin login via DI OAuth2")
+
+        if not self.session_path:
+            raise GarminConnectConnectionError(
+                "Garmin session path is not configured. "
+                "Set the GARMIN_SESSION environment variable to a writable file path."
+            )
+
+        # Step 1: Try loading an existing token file
         if os.path.exists(self.session_path):
             try:
-                log.debug("Loading existing Garmin session")
+                log.debug("Loading existing Garmin token file: %s", self.session_path)
                 self.client.load(self.session_path)
-                if self.looks_like_valid_session():
-                    log.info(f"Successfully loaded Garmin session for user: {self.client.username}")
+                if self.client.is_authenticated:
+                    log.info("Garmin session restored from token file")
                     return
                 else:
-                    log.warning("Session file exists but appears invalid or expired")
+                    log.warning(
+                        "Token file exists but contains no valid tokens — "
+                        "will re-authenticate with credentials"
+                    )
             except Exception as ex:
-                log.warning(f"Failed to load Garmin session: {ex}")
-        
-        # Fallback to credential authentication
+                log.warning("Failed to load Garmin token file: %s", ex)
+
+        # Step 2: Authenticate with credentials
         if not email or not password:
-            raise APIException(
-                "No valid session found and no credentials provided. "
-                "For MFA accounts:"
-                "1) Authenticate once using Garmin Connect mobile app or web interface, "
-                "2) Locate the .garmin_session file in your home directory, "
-                "3) Copy this file to the location specified by GARMIN_SESSION environment variable."
+            raise GarminConnectAuthenticationError(
+                "No valid Garmin session found and no credentials provided.\n"
+                "Please provide credentials via:\n"
+                "  • --garmin-username / --garmin-password CLI flags, or\n"
+                "  • GARMIN_USERNAME / GARMIN_PASSWORD environment variables, or\n"
+                "  • A .env file in the working directory.\n\n"
+                "If your account has MFA enabled, you may need to:\n"
+                "  1. Run withings-sync interactively once to complete MFA.\n"
+                "  2. The DI OAuth token file will be saved automatically.\n"
+                "  3. Subsequent runs will use the saved token file.\n\n"
+                f"Token file location: {self.session_path}"
             )
-        
+
         # Check write permissions BEFORE attempting authentication
         session_dir = os.path.dirname(self.session_path)
         if session_dir and not os.access(session_dir, os.W_OK):
-            log.warning(f"Cannot write to session directory: {session_dir}")
-        
+            log.warning("Cannot write to session directory: %s", session_dir)
+
         try:
-            log.info("Attempting Garmin authentication with credentials")
+            log.info("Authenticating with Garmin Connect via DI OAuth2")
             self.client.login(email, password)
-            log.info("Garmin authentication successful")
-            
+            log.info("Garmin DI OAuth2 authentication successful")
+
+        except GarminConnectAuthenticationError:
+            # Re-raise auth errors directly — they have good messages already
+            raise
+        except GarminConnectTooManyRequestsError:
+            raise
         except Exception as ex:
-            raise APIException(
-                f"Authentication failure: {ex}. "
-                f"For MFA accounts, credential-based login may not work. "
-                f"Use the session file method described in the error message above."
-            )
-        
-        # Save session separately to handle dump failures distinctly
+            raise GarminConnectConnectionError(
+                f"Garmin authentication failed: {ex}\n\n"
+                "Possible causes:\n"
+                "  • Incorrect email or password\n"
+                "  • MFA is enabled (credential login requires interactive MFA completion)\n"
+                "  • Garmin SSO service is temporarily unavailable\n"
+                "  • Cloudflare is blocking the connection (try installing curl-cffi)\n\n"
+                "To install curl-cffi for better Cloudflare bypass:\n"
+                "  pip install curl-cffi ua-generator"
+            ) from ex
+
+        # Step 3: Persist tokens for future runs
         try:
-            # Ensure parent directory exists before dumping session
             if session_dir:
                 os.makedirs(session_dir, exist_ok=True)
-                log.debug("Session directory created/verified")
-            
+
             self.client.dump(self.session_path)
-            log.info(f"Successfully saved Garmin session to {self.session_path}")
-            
+            log.info("Garmin DI OAuth tokens saved to %s", self.session_path)
+
         except Exception as ex:
-            raise APIException(
-                f"Session save failed: {ex}. Authentication succeeded but session could not be persisted. "
-                f"Check GARMIN_SESSION path, permissions, and available disk space."
+            log.warning(
+                "Authentication succeeded but token file could not be saved: %s. "
+                "Next run will require re-authentication. "
+                "Check that %s is writable.",
+                ex,
+                self.session_path,
             )
 
-    def looks_like_valid_session(self) -> bool:
-        return hasattr(self.client, "username") and self.client.username
-
-    def invalid_garmin_session_config(self) -> bool:
-        return not self.session_path
-
     def upload_file(self, ffile):
-        """Upload fit file to Garmin Connect."""
+        """Upload a FIT file to Garmin Connect."""
         fit_file = io.BytesIO(ffile.getvalue())
         fit_file.name = "withings.fit"
-        self.client.upload(fit_file)
+        self.client.post(
+            "connectapi",
+            "/upload-service/upload",
+            files={"file": ("withings.fit", fit_file)},
+        )
         return True

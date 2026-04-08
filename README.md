@@ -5,6 +5,7 @@
 > - The container now runs without root privileges.
 > - Dependencies, virtual envs, packaging is now done by Poetry.
 > - This fork requires a recent version of Python, currently capped at >= python 3.12.
+> - **Garmin Authentication**: Removed the `garth` dependency and replaced it with a native DI OAuth engine due to Cloudflare blocks. Existing Garmin session files are incompatible; users must re-authenticate once.
 >
 > Make sure to go over the updated readme and test these new changes thoroughly for your environment.
 > Chances are quite high you will have to make changes to make this work again. 
@@ -460,30 +461,34 @@ In the case of credentials being available via multiple means (e.g. [environment
 
 ## 4. Tips
 
-### 4.1 Garmin SSO errors
+### 4.1 Garmin SSO errors / Cloudflare Blocks
 
 Some users reported errors raised by the Garmin SSO login:
 
 ```
-withings_sync.garmin.APIException: SSO error 401
+GarminConnectConnectionError: Garmin authentication failed ...
+Possible causes:
+  • Incorrect email or password
+  • MFA is enabled ...
+  • Cloudflare is blocking the connection (try installing curl-cffi)
 ```
 
-or
-
-```
-withings_sync.garmin.APIException: SSO error 403
-```
-
-These errors are raised if a user tries to login too frequently.
-E.g. by running the script every 10 minutes.
+These errors can be raised if your IP gets blocked by Cloudflare, or if you try to login too frequently (e.g. by running the script every 10 minutes).
 
 **We recommend to run the script around 8-10 times per day (every 2-3 hours).**
+
+If you encounter persistent **Cloudflare blocking**, you can install the optional `curl-cffi` dependency which accurately impersonates a browser to bypass the block:
+```bash
+pip install withings-sync[cffi]
+```
 
 See also: https://github.com/jaroslawhartman/withings-sync/issues/31
 
 ### 4.2 Garmin auth
 
-You can configure the location of the garmin session file with the variabe `GARMIN_SESSION`.
+You can configure the location of the garmin session state with the variable `GARMIN_SESSION`.
+
+By default, the script stores Garmin session tokens (using the DI OAuth engine) as JSON. If you previously used the script, the old binary `garth` format session files are NO LONGER compatible. You will need to re-authenticate with your Garmin username and password once to generate the new JSON token file (`garmin_tokens.json`).
 
 Note: If you specify both `--config-folder` and the `GARMIN_SESSION` environment variable, the `--config-folder` option takes precedence.
 
@@ -491,7 +496,7 @@ Note: If you specify both `--config-folder` and the `GARMIN_SESSION` environment
 
 By default, withings-sync stores session files in your home directory:
 - `~/.withings_user.json` for Withings authentication
-- `~/.garmin_session` for Garmin authentication
+- `~/.garmin_session/garmin_tokens.json` for Garmin authentication
 
 You can use the `--config-folder` or `-c` argument to store all session files in a custom folder:
 
@@ -545,10 +550,10 @@ mkdir -p /data/config
 poetry run withings-sync --config-folder /data/config --fromdate=<RECORDED_DATE>
 ```
 It is important that this run includes a date that has a record, as a record is required for the program to attempt an upload to garmin in order to create the session files for garmin.
-The command above will allow entering the withings token and the MFA code for garmin. 
+The command above will allow entering the withings token and completing the login for garmin. 
 After successful auth, the credentials will be automatically stored in `/data/config/`:
 - `/data/config/.withings_user.json`
-- `/data/config/.garmin_session`
+- `/data/config/.garmin_session/garmin_tokens.json`
 
 5. Create the cron job. Update the cron job command to use the config folder:
 ```

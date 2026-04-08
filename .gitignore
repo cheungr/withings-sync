@@ -4,3 +4,6 @@ dist/
 .idea
 *.json
 .env
+.uv_bin/uvx
+.uv_bin/uv
+.uv_bin/env
