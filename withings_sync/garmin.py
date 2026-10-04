@@ -1,177 +1,143 @@
-"""This module handles the Garmin connectivity."""
+"""Garmin Connect authentication and FIT body-composition uploads."""
 
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
+import getpass
+import json
 import logging
-import os
-import sys
-import tempfile
-from pathlib import Path
+from typing import Callable
 
 from garminconnect import Garmin
-
-log = logging.getLogger("garmin")
-
-HOME = os.getenv("HOME", ".")
-GARMIN_SESSION = os.path.abspath(
-    os.path.expanduser(
-        os.getenv("GARMIN_SESSION", os.path.join(HOME, ".garmin_session"))
-    )
+from garminconnect.exceptions import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
 )
 
-TOKENSTORE_FILENAME = "garmin_tokens.json"
+from withings_sync.fit import FitEncoderWeight
+from withings_sync.storage import Storage
+from withings_sync.withings import Measurement
+
+log = logging.getLogger(__name__)
+GARMIN_TOKEN_FILE = "garmin_tokens.json"
+REAUTH_MESSAGE = (
+    "Garmin authentication failed. Run: "
+    "docker compose run --rm withings-sync auth garmin"
+)
 
 
-class LoginFailed(Exception):
-    """Raised when login fails."""
+def token_expiry(token: str | None) -> datetime | None:
+    if not token:
+        return None
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return datetime.fromtimestamp(int(claims["exp"]), timezone.utc)
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
-class APIException(Exception):
-    """Raised for API exceptions."""
+class GarminClient:
+    def __init__(self, storage: Storage):
+        self.storage = storage
+        self.token_path = storage.directory / GARMIN_TOKEN_FILE
+        self.client: Garmin | None = None
 
+    def status(self) -> tuple[bool, datetime | None]:
+        try:
+            data = json.loads(self.token_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False, None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read Garmin token file: {exc}") from exc
+        expiry = token_expiry(data.get("di_token"))
+        return bool(data.get("di_refresh_token") or data.get("di_token")), expiry
 
-class GarminConnect:
-    """Main GarminConnect class."""
+    def _login(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+        prompt_mfa: Callable[[], str] | None = None,
+    ) -> Garmin:
+        self.token_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
+        client.login(tokenstore=str(self.token_path))
+        self.client = client
+        self._persist()
+        return client
 
-    def __init__(self, config_folder=None) -> None:
-        self.client = None
-        self.config_folder = config_folder
+    def connect(self) -> Garmin:
+        if self.client:
+            return self.client
+        try:
+            return self._login()
+        except GarminConnectAuthenticationError as exc:
+            raise RuntimeError(f"{REAUTH_MESSAGE}. Details: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Garmin Connect is unavailable: {exc}") from exc
 
-        if config_folder:
-            self.session_path = os.path.join(config_folder, ".garmin_session")
-        else:
-            self.session_path = GARMIN_SESSION
+    def authenticate(
+        self,
+        email: str,
+        password: str,
+        mfa_code: str | None = None,
+    ) -> None:
+        def prompt() -> str:
+            return mfa_code if mfa_code else input("Garmin MFA code: ").strip()
 
-        # Log helpful message if using new config folder and no tokenstore exists yet
-        tokenstore_path = self._normalize_tokenstore_path()
-        if config_folder and not os.path.exists(tokenstore_path):
-            home = os.getenv("HOME", ".")
-            legacy_path = os.path.abspath(
-                os.path.expanduser(os.path.join(home, ".garmin_session"))
-            )
-            if os.path.exists(legacy_path):
+        self._login(email=email, password=password, prompt_mfa=prompt)
+        self._persist()
+
+    def authenticate_interactively(self, mfa_code: str | None = None) -> None:
+        has_tokens, expiry = self.status()
+        if has_tokens:
+            try:
+                self._login()
                 log.info(
-                    "Existing garth session files cannot be reused directly. "
-                    "After one fresh login, new Garmin tokens will be stored at: %s",
-                    tokenstore_path,
+                    "Existing Garmin token is valid; no password is needed%s.",
+                    f" (access expires {expiry.isoformat()})" if expiry else "",
                 )
+                return
+            except GarminConnectAuthenticationError:
+                log.info("Saved Garmin credentials were rejected; a new login is required.")
+            except GarminConnectConnectionError as exc:
+                raise RuntimeError(f"Garmin login could not reach Connect: {exc}") from exc
+        email = input("Garmin email: ").strip()
+        password = getpass.getpass("Garmin password: ")
+        self.authenticate(email, password, mfa_code)
 
-    def _normalize_tokenstore_path(self) -> str:
-        """Map legacy file-style paths to safe tokenstore paths.
+    def _persist(self) -> None:
+        if not self.client:
+            raise RuntimeError("Garmin client has no authenticated session.")
+        self.client.client.dump(str(self.token_path))
 
-        python-garminconnect's client.load()/dump() append garmin_tokens.json
-        when the path is a directory or doesn't end in .json. If a legacy garth
-        session FILE exists at the configured path, passing it through unchanged
-        causes a file-inside-file collision that silently defeats token persistence.
-        """
-        path = Path(self.session_path).expanduser()
-
-        # Preserve explicit upstream-native .json file paths
-        if path.suffix == ".json":
-            return str(path)
-
-        # Preserve explicit directory paths
-        if path.exists() and path.is_dir():
-            return str(path)
-
-        # Map legacy file-style paths (e.g. ~/.garmin_session) to a .json file
-        # to avoid collision with old garth session files
-        return f"{path}.json"
-
-    def _prompt_mfa(self) -> str:
-        """Prompt the user for their Garmin MFA code.
-
-        Called by python-garminconnect when MFA is required during credential
-        login. Fails fast in non-interactive environments (e.g. k8s cron,
-        Docker without a TTY) instead of blocking on input() with no way for
-        the user to respond.
-        """
-        if not sys.stdin.isatty():
-            raise APIException(
-                "Garmin requires an MFA code but no interactive terminal is "
-                "available. Run withings-sync interactively once so tokens can be "
-                "saved to the tokenstore; subsequent runs will reuse the tokens "
-                "without prompting."
-            )
-        return input("MFA code: ")
-
-    def _token_artifact_path(self, tokenstore_path: str) -> str:
-        """Determine where garminconnect will actually write the token file.
-
-        Mirrors the logic in garminconnect's client.load()/dump():
-        if the path ends in .json it's used directly, otherwise
-        garmin_tokens.json is appended inside the directory.
-        """
-        if tokenstore_path.endswith(".json"):
-            return tokenstore_path
-        return os.path.join(tokenstore_path, TOKENSTORE_FILENAME)
-
-    def login(self, email=None, password=None):
-        """Login to Garmin Connect.
-
-        Attempts tokenstore-first login: if saved tokens exist and are still
-        valid, credentials are not required. Credential-based login is only
-        attempted when token restore fails.
-        """
-        tokenstore_path = self._normalize_tokenstore_path()
-        token_artifact = self._token_artifact_path(tokenstore_path)
-
-        # Ensure parent directory exists before attempting login/token save
-        write_target = (
-            os.path.dirname(tokenstore_path)
-            if tokenstore_path.endswith(".json")
-            else tokenstore_path
+    def upload(self, measurement: Measurement) -> None:
+        client = self.connect()
+        encoder = FitEncoderWeight()
+        encoder.write_file_info(time_created=measurement.timestamp)
+        encoder.write_file_creator()
+        encoder.write_device_info(timestamp=measurement.timestamp)
+        encoder.write_weight_scale(
+            timestamp=measurement.timestamp,
+            weight=measurement.weight,
+            percent_fat=measurement.percent_fat,
+            percent_hydration=measurement.percent_hydration,
+            bone_mass=measurement.bone_mass,
+            muscle_mass=measurement.muscle_mass,
+            visceral_fat_rating=measurement.visceral_fat,
+            bmi=measurement.bmi,
         )
-        if write_target:
-            os.makedirs(write_target, exist_ok=True)
-
-        # Check write permissions — garminconnect silently suppresses token
-        # save failures via contextlib.suppress(Exception), so without this
-        # warning the user would re-authenticate on every run with no indication
-        if write_target and not os.access(write_target, os.W_OK):
-            log.warning(
-                "Cannot write to Garmin tokenstore location: %s. "
-                "Tokens may not persist between runs.",
-                write_target,
-            )
-
+        encoder.finish()
         try:
-            self.client = Garmin(email, password, prompt_mfa=self._prompt_mfa)
-            self.client.login(tokenstore_path)
-            log.info("Garmin authentication successful")
-        except APIException:
-            raise
-        except Exception as ex:
-            if not email or not password:
-                raise APIException(
-                    "No valid saved Garmin tokenstore was found and no credentials "
-                    "were provided. If you upgraded from garth, the old "
-                    ".garmin_session file cannot be reused directly; perform one "
-                    "fresh login to create a new python-garminconnect tokenstore."
-                ) from ex
-
-            raise APIException(
-                f"Authentication failure: {ex}. "
-                "Ensure your credentials are correct. "
-                "For MFA accounts, you may need to authenticate interactively first."
-            ) from ex
-
-        # Verify token was actually persisted — garminconnect uses
-        # contextlib.suppress(Exception) on dump(), so a silent failure
-        # means every future run hits Garmin SSO again
-        if not os.path.exists(token_artifact):
-            log.warning(
-                "Garmin tokens were not saved to %s. Without persisted tokens, "
-                "future runs may require re-authentication.",
-                token_artifact,
+            client.client.post(
+                "connectapi",
+                "/upload-service/upload",
+                files={"file": ("body_composition.fit", encoder.getvalue())},
+                api=True,
             )
-
-    def upload_file(self, ffile):
-        """Upload fit file to Garmin Connect."""
-        # python-garminconnect only accepts file paths, not file-like objects
-        with tempfile.NamedTemporaryFile(suffix=".fit", delete=False) as tmp:
-            tmp.write(ffile.getvalue())
-            tmp_path = tmp.name
-        try:
-            self.client.upload_activity(tmp_path)
+        except GarminConnectAuthenticationError as exc:
+            raise RuntimeError(f"{REAUTH_MESSAGE}. Details: {exc}") from exc
         finally:
-            os.unlink(tmp_path)
-        return True
+            self._persist()
