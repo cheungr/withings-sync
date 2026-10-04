@@ -1,118 +1,143 @@
-"""This module handles the Garmin connectivity."""
+"""Garmin Connect authentication and FIT body-composition uploads."""
 
-import io
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
+import getpass
+import json
 import logging
-import os
+from typing import Callable
 
-import garth
-# Temporary fix until Garth project merges https://github.com/matin/garth/issues/73
-garth.http.USER_AGENT = {"User-Agent": ("GCM-iOS-5.7.2.1")}
+from garminconnect import Garmin
+from garminconnect.exceptions import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+)
 
-log = logging.getLogger("garmin")
+from withings_sync.fit import FitEncoderWeight
+from withings_sync.storage import Storage
+from withings_sync.withings import Measurement
 
-HOME = os.getenv("HOME", ".")
-GARMIN_SESSION = os.path.abspath(os.path.expanduser(os.getenv('GARMIN_SESSION', os.path.join(HOME, ".garmin_session"))))
-
-
-class LoginFailed(Exception):
-    """Raised when login fails."""
-
-
-class APIException(Exception):
-    """Raised for API exceptions."""
+log = logging.getLogger(__name__)
+GARMIN_TOKEN_FILE = "garmin_tokens.json"
+REAUTH_MESSAGE = (
+    "Garmin authentication failed. Run: "
+    "docker compose run --rm withings-sync auth garmin"
+)
 
 
-class GarminConnect:
-    """Main GarminConnect class."""
+def token_expiry(token: str | None) -> datetime | None:
+    if not token:
+        return None
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return datetime.fromtimestamp(int(claims["exp"]), timezone.utc)
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
-    def __init__(self, config_folder=None) -> None:
-        self.client = garth.Client()
-        self.config_folder = config_folder
-        
-        if config_folder:
-            self.session_path = os.path.join(config_folder, ".garmin_session")
-        else:
-            self.session_path = GARMIN_SESSION
-        
-        # Log helpful message if using new config folder and file doesn't exist
-        if config_folder and not os.path.exists(self.session_path):
-            home = os.getenv("HOME", ".")
-            legacy_path = os.path.abspath(os.path.expanduser(os.path.join(home, ".garmin_session")))
-            if os.path.exists(legacy_path):
-                log.info(f"Using new config folder: {self.session_path}")
-                log.info(f"If you want to use existing session, copy from: {legacy_path}")
 
-    def login(self, email=None, password=None):
-        """Login to Garmin Connect with session persistence and MFA support."""
-        log.debug("Attempting Garmin login")
-        
-        if GarminConnect.invalid_garmin_session_config(self):
-            raise APIException("invalid garmin session path config")
-        
-        if os.path.exists(self.session_path):
+class GarminClient:
+    def __init__(self, storage: Storage):
+        self.storage = storage
+        self.token_path = storage.directory / GARMIN_TOKEN_FILE
+        self.client: Garmin | None = None
+
+    def status(self) -> tuple[bool, datetime | None]:
+        try:
+            data = json.loads(self.token_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False, None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read Garmin token file: {exc}") from exc
+        expiry = token_expiry(data.get("di_token"))
+        return bool(data.get("di_refresh_token") or data.get("di_token")), expiry
+
+    def _login(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+        prompt_mfa: Callable[[], str] | None = None,
+    ) -> Garmin:
+        self.token_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
+        client.login(tokenstore=str(self.token_path))
+        self.client = client
+        self._persist()
+        return client
+
+    def connect(self) -> Garmin:
+        if self.client:
+            return self.client
+        try:
+            return self._login()
+        except GarminConnectAuthenticationError as exc:
+            raise RuntimeError(f"{REAUTH_MESSAGE}. Details: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Garmin Connect is unavailable: {exc}") from exc
+
+    def authenticate(
+        self,
+        email: str,
+        password: str,
+        mfa_code: str | None = None,
+    ) -> None:
+        def prompt() -> str:
+            return mfa_code if mfa_code else input("Garmin MFA code: ").strip()
+
+        self._login(email=email, password=password, prompt_mfa=prompt)
+        self._persist()
+
+    def authenticate_interactively(self, mfa_code: str | None = None) -> None:
+        has_tokens, expiry = self.status()
+        if has_tokens:
             try:
-                log.debug("Loading existing Garmin session")
-                self.client.load(self.session_path)
-                if self.looks_like_valid_session():
-                    log.info(f"Successfully loaded Garmin session for user: {self.client.username}")
-                    return
-                else:
-                    log.warning("Session file exists but appears invalid or expired")
-            except Exception as ex:
-                log.warning(f"Failed to load Garmin session: {ex}")
-        
-        # Fallback to credential authentication
-        if not email or not password:
-            raise APIException(
-                "No valid session found and no credentials provided. "
-                "For MFA accounts:"
-                "1) Authenticate once using Garmin Connect mobile app or web interface, "
-                "2) Locate the .garmin_session file in your home directory, "
-                "3) Copy this file to the location specified by GARMIN_SESSION environment variable."
-            )
-        
-        # Check write permissions BEFORE attempting authentication
-        session_dir = os.path.dirname(self.session_path)
-        if session_dir and not os.access(session_dir, os.W_OK):
-            log.warning(f"Cannot write to session directory: {session_dir}")
-        
+                self._login()
+                log.info(
+                    "Existing Garmin token is valid; no password is needed%s.",
+                    f" (access expires {expiry.isoformat()})" if expiry else "",
+                )
+                return
+            except GarminConnectAuthenticationError:
+                log.info("Saved Garmin credentials were rejected; a new login is required.")
+            except GarminConnectConnectionError as exc:
+                raise RuntimeError(f"Garmin login could not reach Connect: {exc}") from exc
+        email = input("Garmin email: ").strip()
+        password = getpass.getpass("Garmin password: ")
+        self.authenticate(email, password, mfa_code)
+
+    def _persist(self) -> None:
+        if not self.client:
+            raise RuntimeError("Garmin client has no authenticated session.")
+        self.client.client.dump(str(self.token_path))
+
+    def upload(self, measurement: Measurement) -> None:
+        client = self.connect()
+        encoder = FitEncoderWeight()
+        encoder.write_file_info(time_created=measurement.timestamp)
+        encoder.write_file_creator()
+        encoder.write_device_info(timestamp=measurement.timestamp)
+        encoder.write_weight_scale(
+            timestamp=measurement.timestamp,
+            weight=measurement.weight,
+            percent_fat=measurement.percent_fat,
+            percent_hydration=measurement.percent_hydration,
+            bone_mass=measurement.bone_mass,
+            muscle_mass=measurement.muscle_mass,
+            visceral_fat_rating=measurement.visceral_fat,
+            bmi=measurement.bmi,
+        )
+        encoder.finish()
         try:
-            log.info("Attempting Garmin authentication with credentials")
-            self.client.login(email, password)
-            log.info("Garmin authentication successful")
-            
-        except Exception as ex:
-            raise APIException(
-                f"Authentication failure: {ex}. "
-                f"For MFA accounts, credential-based login may not work. "
-                f"Use the session file method described in the error message above."
+            client.client.post(
+                "connectapi",
+                "/upload-service/upload",
+                files={"file": ("body_composition.fit", encoder.getvalue())},
+                api=True,
             )
-        
-        # Save session separately to handle dump failures distinctly
-        try:
-            # Ensure parent directory exists before dumping session
-            if session_dir:
-                os.makedirs(session_dir, exist_ok=True)
-                log.debug("Session directory created/verified")
-            
-            self.client.dump(self.session_path)
-            log.info(f"Successfully saved Garmin session to {self.session_path}")
-            
-        except Exception as ex:
-            raise APIException(
-                f"Session save failed: {ex}. Authentication succeeded but session could not be persisted. "
-                f"Check GARMIN_SESSION path, permissions, and available disk space."
-            )
-
-    def looks_like_valid_session(self) -> bool:
-        return hasattr(self.client, "username") and self.client.username
-
-    def invalid_garmin_session_config(self) -> bool:
-        return not self.session_path
-
-    def upload_file(self, ffile):
-        """Upload fit file to Garmin Connect."""
-        fit_file = io.BytesIO(ffile.getvalue())
-        fit_file.name = "withings.fit"
-        self.client.upload(fit_file)
-        return True
+        except GarminConnectAuthenticationError as exc:
+            raise RuntimeError(f"{REAUTH_MESSAGE}. Details: {exc}") from exc
+        finally:
+            self._persist()

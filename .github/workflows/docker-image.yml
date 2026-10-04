@@ -25,12 +25,6 @@ jobs:
       - name: Checkout repository 🛒 
         uses: actions/checkout@v6
 
-      - name: Update version in pyproject.toml ⬆️
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          sed -i "s/version = \"1.0.0.dev1\"/version = \"$VERSION\"/" pyproject.toml
-
       - name: Set up QEMU 👷
         uses: docker/setup-qemu-action@v4
 
